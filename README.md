@@ -2,7 +2,7 @@
 
 A full-stack email scheduling application that accepts email send requests, schedules them using BullMQ and Redis, delivers emails through SMTP, and provides a dashboard for monitoring scheduled, sent, failed, and queued emails.
 
-The application stores email and campaign records in PostgreSQL and BullMQ queue state in Redis. The API and BullMQ worker are separate processes. Queue recovery across process restarts depends on Redis retaining its data; the current free Render Key Value plan does not provide Redis persistence (see [Current Production Deployment](#current-production-deployment)).
+The application stores email and campaign records in PostgreSQL and BullMQ queue state in Redis. The API and BullMQ worker run as separate processes. BullMQ is designed to recover scheduled jobs from Redis after API or worker process restarts, provided the Redis datastore itself retains its data. The current free Render Key Value deployment is in-memory and does not provide Redis persistence across datastore restarts.
 
 ---
 
@@ -808,6 +808,10 @@ For production deployment, additional role-based authorization should be conside
 ---
 
 ## Current Production Deployment
+
+**Application implementation:** The deployed application currently uses Vercel for the frontend and Render for the API, PostgreSQL, and Key Value datastore. The production BullMQ worker requires a continuously running worker process. The local development environment includes the API and worker and has been tested end-to-end with Ethereal SMTP.
+
+**Current free hosting limitation:** The current free Render Key Value deployment does not provide persistence across Redis datastore restarts. A persistent Redis deployment is therefore required to provide the full restart-persistence guarantee in production.
 
 | Component | Production endpoint / state |
 |---|---|

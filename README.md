@@ -2,7 +2,7 @@
 
 A full-stack email scheduling application that accepts email send requests, schedules them using BullMQ and Redis, delivers emails through SMTP, and provides a dashboard for monitoring scheduled, sent, failed, and queued emails.
 
-The system is designed to persist scheduled jobs across backend/worker restarts and supports Google authentication, Slack notifications, Elasticsearch search, sender-level rate limiting, and minimum send-spacing controls.
+The application stores email and campaign records in PostgreSQL and BullMQ queue state in Redis. The API and BullMQ worker are separate processes. Queue recovery across process restarts depends on Redis retaining its data; the current free Render Key Value plan does not provide Redis persistence (see [Current Production Deployment](#current-production-deployment)).
 
 ---
 
@@ -37,7 +37,7 @@ The system is designed to persist scheduled jobs across backend/worker restarts 
 - BullMQ is used for persistent job scheduling.
 - Redis stores BullMQ queue state and delayed jobs.
 - Worker concurrency is configurable.
-- Scheduled jobs survive backend and worker restarts.
+- Queue state is stored in Redis, so BullMQ can recover jobs after API or worker restarts while Redis retains its data.
 - Email jobs move through states such as:
   - `SCHEDULED`
   - `PROCESSING`
@@ -95,6 +95,14 @@ It displays queue states such as:
 - Completed
 - Failed
 
+### Feature coverage
+
+| Area | Implemented functionality |
+|---|---|
+| Backend | Express API; Google OAuth and Redis-backed sessions; user-scoped PostgreSQL/Prisma records; SMTP sender management; campaign and email scheduling; BullMQ delayed jobs; separate worker; sender hourly limits and spacing; email status/history; Slack integration; Elasticsearch search; authenticated read-only Bull Board dashboard |
+| Frontend | Google sign-in; dashboard and email statistics; compose/schedule with sender selection; CSV/TXT recipient import; scheduled/sent/failed email views; search; campaign views; sender settings; Slack integration status; logout |
+| Infrastructure / deployment | Vercel frontend and Render API/PostgreSQL/Redis are deployed. Ethereal SMTP sender setup is configured in the app. Production BullMQ worker hosting is pending; see [Current Production Deployment](#current-production-deployment). |
+
 ---
 
 ## 2. Architecture
@@ -107,7 +115,7 @@ It displays queue states such as:
                                     │
                                     ▼
                          ┌─────────────────────┐
-                         │   Express Backend   │
+                         │   Express API       │
                          │   localhost:5000    │
                          └──────┬──────┬───────┘
                                 │      │
@@ -122,6 +130,7 @@ It displays queue states such as:
                                                        ▼
                                              ┌─────────────────┐
                                              │  BullMQ Worker  │
+                                             │ separate process│
                                              └────────┬────────┘
                                                       │
                                                       ▼
@@ -199,6 +208,8 @@ ReachInbox-Scheduler/
 │   │   ├── workers/
 │   │   └── scripts/
 │   ├── prisma/
+│   │   ├── migrations/
+│   │   └── schema.prisma
 │   ├── package.json
 │   └── .env.example
 │
@@ -219,7 +230,7 @@ Install:
 
 - Node.js
 - npm
-- Docker Desktop
+- Docker Desktop (optional if PostgreSQL, Redis, and Elasticsearch are available another way)
 - Git
 
 The project uses Docker Compose for the local PostgreSQL, Redis, and Elasticsearch services.
@@ -240,19 +251,19 @@ Check the containers:
 docker-compose ps
 ```
 
-The application requires:
+The backend requires PostgreSQL and Redis. Elasticsearch is optional for best-effort email indexing and search. The supplied Compose file starts all three services for local development:
 
 - PostgreSQL
 - Redis
 - Elasticsearch
 
-Redis is configured with:
+The local Redis service is configured with:
 
 ```text
 maxmemory-policy noeviction
 ```
 
-This is required for reliable BullMQ operation.
+This avoids Redis evicting queue keys when memory is full. The Compose file uses named volumes for local data.
 
 ---
 
@@ -279,11 +290,13 @@ backend/.env.example
 
 as the template.
 
-Run Prisma migrations:
+Apply the checked-in Prisma migrations to the local database:
 
 ```bash
 npx prisma migrate dev
 ```
+
+`prisma.config.ts` reads the connection string from `DATABASE_URL`. `npm run build` runs `prisma generate` and then TypeScript compilation.
 
 Build the backend:
 
@@ -305,6 +318,14 @@ Health check:
 
 `http://localhost:5000/health`
 
+Production API start command (used by the Render web service):
+
+```bash
+npm start
+```
+
+This starts the API only. It does not start the worker.
+
 ---
 
 ## 8. Start the Worker
@@ -316,7 +337,12 @@ cd backend
 npm run worker
 ```
 
-The worker processes scheduled BullMQ email jobs.
+The development worker processes scheduled BullMQ email jobs. The API and worker must run as separate processes. For a built production worker, use:
+
+```bash
+npm run build
+npm run worker:prod
+```
 
 Keep the worker running while testing scheduled email delivery.
 
@@ -336,22 +362,24 @@ Frontend:
 
 `http://localhost:5173`
 
+The frontend chooses `http://localhost:5000` when opened on localhost; otherwise it uses the deployed Render API URL embedded in `frontend/src/lib/api.js`. Build the static frontend with `npm run build` (output: `frontend/dist/`).
+
 ---
 
 ## 10. Environment Variables
 
-The backend `.env` contains configuration for the application.
+The backend reads configuration from `backend/.env` locally and from the hosting service's environment in production. The following names are used in source code; provide real values only in a private environment, never in this README or Git.
 
 Important variables include:
 
 ### Database
-- `DATABASE_URL`
+- `DATABASE_URL` — required by the API and worker; Prisma uses it for PostgreSQL.
 
 ### Redis
-Redis connection configuration used by BullMQ and application services.
+- `REDIS_URL` — required by the API and worker; accepts `redis://` or `rediss://`.
 
 ### Elasticsearch
-Elasticsearch connection configuration.
+- `ELASTICSEARCH_URL` — optional; successful email indexing/search uses it when configured.
 
 ### Google OAuth
 - `GOOGLE_CLIENT_ID`
@@ -366,6 +394,7 @@ For local development, the Google callback is:
 ```text
 FRONTEND_URL=http://localhost:5173
 ```
+`FRONTEND_URL` is the allowed browser origin and OAuth return destination; set it to the deployed frontend origin in production.
 
 ### Slack OAuth
 - `SLACK_CLIENT_ID`
@@ -379,9 +408,52 @@ Local Slack callback:
 
 ### SMTP
 
-Configure the sender's SMTP credentials through the application's sender configuration.
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_SECURE` are supported fallback settings by the mailer. Normal scheduled worker delivery uses the SMTP details saved on the selected sender record in the app.
 
-For development testing, Ethereal Email can be used.
+### Worker
+
+- `WORKER_CONCURRENCY` — optional positive integer; defaults to `5`.
+- `PORT` — optional API listen port; defaults to `5000`.
+
+Google and Slack variables above are required only when those integrations are used. SMTP fallback variables are not needed when each sender is configured in Settings.
+
+Example names and placeholder-only values (replace locally; never commit real credentials):
+
+```dotenv
+PORT=5000
+DATABASE_URL=<your-postgresql-connection-url>
+REDIS_URL=<your-redis-connection-url>
+ELASTICSEARCH_URL=<your-elasticsearch-url>
+FRONTEND_URL=http://localhost:5173
+GOOGLE_CLIENT_ID=<your-google-client-id>
+GOOGLE_CLIENT_SECRET=<your-google-client-secret>
+GOOGLE_REDIRECT_URI=http://localhost:5000/api/auth/google/callback
+SLACK_CLIENT_ID=<your-slack-client-id>
+SLACK_CLIENT_SECRET=<your-slack-client-secret>
+SLACK_REDIRECT_URI=http://localhost:5000/api/slack/callback
+SLACK_NOTIFICATION_CHANNEL_ID=<your-slack-channel-id>
+WORKER_CONCURRENCY=5
+SMTP_HOST=smtp.ethereal.email
+SMTP_PORT=587
+SMTP_USER=<your-ethereal-username>
+SMTP_PASSWORD=<your-ethereal-password>
+SMTP_SECURE=false
+```
+
+---
+
+## 10.1 Ethereal Email Testing
+
+Create a test mailbox at [Ethereal Email](https://ethereal.email/) and use the generated SMTP credentials in the app's **Settings → Sender accounts → Add an SMTP sender** form:
+
+```text
+SMTP host: smtp.ethereal.email
+SMTP port: 587
+SMTP username: <your-ethereal-username>
+SMTP password: <your-ethereal-password>
+```
+
+Use the mailbox credentials Ethereal generated for you; do not add them to source control or this README. The application stores sender SMTP credentials on the backend and omits the password from sender API responses. Ethereal captures test messages instead of delivering them to real recipients; use the preview link or Ethereal's web interface to inspect them.
 
 ---
 
@@ -433,16 +505,14 @@ The Slack app must be installed in the workspace and have access to the configur
 
 ## 13. Scheduling an Email
 
-1. Sign in with Google.
-2. Configure/select an SMTP sender.
-3. Open Compose.
-4. Enter recipients or upload a CSV/TXT file.
-5. Enter subject and body.
-6. Configure:
-   - Start time
-   - Minimum delay
-   - Hourly limit
-7. Click Schedule emails.
+1. The frontend sends the authenticated scheduling request to the Express API.
+2. The API creates the campaign and its `EmailJob` rows in a PostgreSQL transaction.
+3. It enqueues one BullMQ `send-email` job per email using the email job UUID and calculated delay in the `email-scheduler` queue.
+4. Redis holds BullMQ's delayed queue state until the scheduled time.
+5. The separate worker consumes due jobs, loads the email, sender, and campaign from PostgreSQL, reserves the sender's rate-limit slot in Redis, and sends through that sender's SMTP settings.
+6. The worker records `SENT` or `FAILED` in PostgreSQL. Elasticsearch indexing and Slack notification are separate best-effort integrations.
+
+In the UI, sign in with Google, configure/select an SMTP sender, open Compose, enter recipients (or upload CSV/TXT), subject and body, choose the start time, minimum delay, and hourly limit, then click **Schedule emails**.
 
 The backend creates the campaign and email jobs atomically in PostgreSQL and enqueues deterministic BullMQ jobs.
 
@@ -614,7 +684,7 @@ Slack notification received
 Email appears in Sent Emails
 ```
 
-This confirms that scheduled jobs survive backend and worker restarts.
+BullMQ stores delayed queue state in Redis rather than only in API/worker memory. Therefore API and worker restarts do not themselves erase queue state, as long as Redis retains its data. The development Compose setup uses a named Redis volume. Persistence depends on the Redis host's plan and configuration; the current free Render Key Value deployment has persistence disabled and can lose queue data when it restarts. This means the current production deployment does not guarantee jobs survive a Redis restart.
 
 ---
 
@@ -651,6 +721,8 @@ npm run slack:test
 ```bash
 npm run delay:test
 npm run rate-limit:test
+npm run campaign-scheduler:test
+npm run test:idempotency
 ```
 
 ### Elasticsearch tests
@@ -663,7 +735,9 @@ npm run elasticsearch:test
 npm run queue-dashboard:test
 ```
 
-The focused automated tests cover authentication, scheduling, BullMQ enqueueing, rate limiting, delayed jobs, Slack behavior, Elasticsearch indexing/search, worker delivery, SMTP failure handling, and queue dashboard access.
+Other backend checks available in `backend/package.json` include `npm run queue:test` and `npm run email:test` (which create test queue/email jobs). `npm run build` is the backend compile check; `npm test` in `frontend/` runs the frontend test suite.
+
+The frontend uses Node's built-in test runner (`node --test`) for UI rendering, CSV/TXT parsing, form validation, and API client behavior. Backend package scripts provide focused runnable checks for authentication/scheduling, Google OAuth, Slack, delayed jobs, rate limiting, idempotency, Elasticsearch, and the queue dashboard. These backend scripts exercise different paths and may require local services and integration credentials; they do not represent complete automated coverage of every feature.
 
 ---
 
@@ -677,8 +751,7 @@ The following functionality has also been manually verified during development:
 - Sent Emails display
 - Slack OAuth connection
 - Real Slack notification delivery
-- Backend and worker restart persistence
-- Scheduled job recovery after restart
+- Backend and worker restart recovery when Redis remains running
 
 ---
 
@@ -712,6 +785,9 @@ Rate-limited jobs remain scheduled and are moved to a future BullMQ delay instea
 - User ownership is resolved server-side.
 - Client-provided user IDs are not trusted for authorization.
 - Slack access tokens are not exposed by the status endpoint.
+- Sender API responses omit SMTP passwords; credentials are stored server-side and should be entered only through the authenticated sender settings form.
+- Keep Google/Slack client secrets, PostgreSQL and Redis credentials, SMTP passwords, and all other secrets in private environment configuration.
+- Do not commit `.env` files; use `backend/.env.example` as the variable-name template.
 - Queue dashboard access requires authentication.
 - The queue dashboard is read-only.
 
@@ -725,8 +801,32 @@ For production deployment, additional role-based authorization should be conside
 - Ethereal Email is intended for development/testing rather than production email delivery.
 - Real third-party OAuth credentials are required for Google and Slack integrations.
 - Production deployment should use HTTPS.
-- Redis should use `maxmemory-policy noeviction`.
-- The current prototype is intended for local/development deployment unless additional production infrastructure and security controls are added.
+- Redis should use `maxmemory-policy noeviction`; job-queue deployments should also enable durable Redis persistence.
+- The production API and database are deployed, but the separate production worker is pending a continuously running host.
+- Free Render Key Value does not persist its data across restarts, so production queue restart durability is limited until a persistent Redis configuration is used.
+
+---
+
+## Current Production Deployment
+
+| Component | Production endpoint / state |
+|---|---|
+| Vercel frontend | [https://reach-inbox-scheduler-kohl.vercel.app/](https://reach-inbox-scheduler-kohl.vercel.app/) — deployed and working |
+| Render backend API | [https://reachinbox-scheduler-03lq.onrender.com](https://reachinbox-scheduler-03lq.onrender.com) — deployed and working |
+| Health check | [ `/health` ](https://reachinbox-scheduler-03lq.onrender.com/health) — reports API status and PostgreSQL connectivity; it does not check Redis or worker status |
+| PostgreSQL | Connected to the Render backend |
+| Redis / Key Value | Configured; free-plan persistence is unavailable |
+| Google OAuth | Working |
+| SMTP sender setup | Working; sender can be selected in Compose |
+| Scheduling API | Working; jobs appear in Scheduled |
+| Production BullMQ worker | Pending a suitable continuously running worker host |
+| End-to-end production delivery | Pending worker deployment; do not infer delivery from successful scheduling |
+
+The deployed frontend and backend URLs are unchanged. The backend production start command is `npm start`, which starts only the Express API. The production worker command is `npm run worker:prod`, but it is not currently running in production.
+
+### Worker hosting limitation
+
+The current free Render Web Service is not a continuously available worker host: it spins down after idle time and may restart. Render also does not offer a free Background Worker, and free web services block outbound SMTP ports 25, 465, and 587. The worker should be deployed separately to a host that can run a persistent Node.js process and connect to the existing production Redis and PostgreSQL. BullMQ must remain the scheduler; cron or polling is not used as a replacement.
 
 ---
 
@@ -742,6 +842,7 @@ docker-compose up -d
 ```bash
 cd backend
 npm install
+npx prisma migrate dev
 npm run dev
 ```
 
@@ -766,26 +867,20 @@ Sign in with Google, configure an SMTP sender, and schedule an email.
 
 ---
 
-## 27. Verification Summary
-
-The implementation has been tested across the main application paths:
+## 27. Project Status
 
 | Feature | Status |
 |---|---|
-| Google OAuth | ✓ |
-| Email scheduling | ✓ |
-| BullMQ queue | ✓ |
-| Redis persistence | ✓ |
-| Worker processing | ✓ |
-| Ethereal SMTP delivery | ✓ |
-| Sent/Failed history | ✓ |
-| Elasticsearch search | ✓ |
-| Rate limiting | ✓ |
-| Minimum send spacing | ✓ |
-| Slack OAuth | ✓ |
-| Slack notification | ✓ |
-| Queue dashboard | ✓ |
-| Restart persistence | ✓ |
+| Vercel frontend | Deployed and working |
+| Render backend API | Deployed and working |
+| PostgreSQL | Connected |
+| Redis / Key Value | Configured; free-plan restart persistence unavailable |
+| Google OAuth | Working |
+| SMTP sender configuration | Working |
+| Scheduling API / jobs in Scheduled | Working |
+| BullMQ worker code | Implemented (`npm run worker:prod`) |
+| Production BullMQ worker | Pending hosting |
+| End-to-end production email delivery | Pending worker deployment |
 
 ---
 
